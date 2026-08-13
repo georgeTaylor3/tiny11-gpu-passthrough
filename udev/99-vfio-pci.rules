@@ -1,0 +1,4 @@
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x2191", ATTR{driver_override}="vfio-pci"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x1aeb", ATTR{driver_override}="vfio-pci"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x1aec", ATTR{driver_override}="vfio-pci"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x1aed", ATTR{driver_override}="vfio-pci"
