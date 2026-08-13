@@ -1,0 +1,240 @@
+#!/bin/bash
+
+# ============================================================================
+# bind-nvidia-usb-vfio
+#
+# Purpose:
+#   Ensure that the NVIDIA USB 3.1 controller at PCI address 01:00.2
+#   is bound to the vfio-pci driver instead of the normal xHCI
+#   USB driver.
+#
+# Why?
+#   The GTX 1660 Ti exposes these PCI functions:
+#
+#     01:00.0 = NVIDIA GPU
+#     01:00.1 = NVIDIA HDMI/DisplayPort audio
+#     01:00.2 = NVIDIA USB 3.1 controller
+#     01:00.3 = NVIDIA USB-C / UCSI controller
+#
+#   01:00.0, 01:00.1, and 01:00.3 bind correctly
+#   to vfio-pci at boot.
+#
+#   However, 01:00.2 gets (sometimes) claimed first by the Linux
+#   xhci_hcd driver. That prevents the VM from cleanly using the entire
+#   NVIDIA PCI device group.
+#   Does the VM need to use all 4 together. Idk. Ill test it
+#   by removing the bind at some point.
+#
+#   This script checks the current state. will moves
+#   01:00.2 from its current driver to vfio-pci.
+#
+# Safety:
+#   The script is designed to be idempotent (new word!!). If the device is already
+#   bound to vfio-pci, it simply reports that and exits successfully.
+# ============================================================================
+
+
+# Exit immediately if a command fails.
+#
+# -e:
+#   Exit when a command returns a non-zero status.
+#
+# -u:
+#   Treat use of an undefined variable as an error.
+#
+# -o pipefail:
+#   If a pipeline contains multiple commands, consider the whole pipeline
+#   failed if any command in it fails.
+#
+# these together help prevent the script from silently continuing after
+# something unexpected happens.
+set -euo pipefail
+
+
+# Full PCI address of the NVIDIA USB 3.1 controller.
+#
+# Linux normally displays this device as:
+#
+#   01:00.2 USB controller:
+#   NVIDIA Corporation TU116 USB 3.1 Host Controller
+#
+# Sysfs requires the full PCI domain prefix, aka must use:
+#   0000:01:00:2
+# could be a way to regex match and do this dynamically. that
+# would be hard though as friendly names differ (probably)
+DEV="0000:01:00.2"
+
+
+# Sysfs path for this specific PCI device.
+#
+# Lin represents PCI hardware under:
+#
+#   /sys/bus/pci/devices/
+#
+# aka this device appears at:
+#
+#   /sys/bus/pci/devices/0000:01:00.2
+DEVICE="/sys/bus/pci/devices/$DEV"
+
+
+# ---------------------------------------------------------------------------
+# STEP 1: Make sure the PCI device actually exists
+# ---------------------------------------------------------------------------
+#
+# If the hardware is missing for some reason, such as:
+#
+#   - firmware no longer exposes it,
+#   - PCI enumeration changed,
+#   - the device was removed,
+#
+# then there is nothing useful for this script to do.
+#
+# We exit successfully instead of causing the boot process to fail.
+# Worst case the tny11 vm doesnt get a usb function of the nvidia group
+# or entire startup of tiny11 fails.
+if [[ ! -e "$DEVICE" ]]; then
+    echo "$DEV does not exist; nothing to do."
+    exit 0
+fi
+
+
+# ---------------------------------------------------------------------------
+# STEP 2: Make sure the vfio-pci kernel driver is loaded
+# ---------------------------------------------------------------------------
+#
+# vfio-pci is the Linux kernel driver used to reserve PCI hardware for
+# assignment to a virtual machine.
+#
+# modprobe is safe to run even if vfio-pci is already loaded.
+modprobe vfio-pci
+
+
+# ---------------------------------------------------------------------------
+# STEP 3: Tell Linux this device should use vfio-pci
+# ---------------------------------------------------------------------------
+#
+# driver_override tells the PCI subsystem that this specific PCI function
+# should bind only to the named driver.
+#
+# This helps prevent another compatible driver, (xhci_hcd in this case),
+# from reclaiming the device later.
+#
+# IMPORTANT:
+# driver_override by itself does NOT unbind an already-attached driver.
+# That is why later steps explicitly check and unbind the current driver.
+echo vfio-pci > "$DEVICE/driver_override"
+
+
+# ---------------------------------------------------------------------------
+# STEP 4: Determine which driver currently owns the device
+# ---------------------------------------------------------------------------
+#
+# If a PCI device has a driver attached, sysfs provides a symbolic link:
+#
+#   /sys/bus/pci/devices/0000:01:00.2/driver
+#
+# readlink -f resolves that link to something like:
+#
+#   /sys/bus/pci/drivers/xhci_hcd     or:    /sys/bus/pci/drivers/vfio-pci
+#
+# basename extracts only the driver name.
+if [[ -L "$DEVICE/driver" ]]; then
+    CURRENT_DRIVER="$(basename "$(readlink -f "$DEVICE/driver")")"
+else
+    # If there is no driver link, the device currently has no driver bound.
+    CURRENT_DRIVER=""
+fi
+
+
+# Show the current state in the terminal.
+echo "$DEV current driver: ${CURRENT_DRIVER:-none}"
+
+
+# ---------------------------------------------------------------------------
+# STEP 5: If the device is already on vfio-pci, do nothing
+# ---------------------------------------------------------------------------
+#
+# This makes the script safe to run repeatedly.
+#
+# For example, if the device bound correctly during boot before this
+# script ran, do not unbind and rebind it as its redundant.
+if [[ "$CURRENT_DRIVER" == "vfio-pci" ]]; then
+    echo "$DEV is already bound to vfio-pci."
+    exit 0
+fi
+
+
+# ---------------------------------------------------------------------------
+# STEP 6: If another driver owns the device, unbind it
+# ---------------------------------------------------------------------------
+#
+# xhci_hcd has historically (for me) taken ownership of 
+# the device at some point
+#
+# Instead of hard-coding xhci_hcd, use CURRENT_DRIVER so the script
+# still behaves correctly if some other driver owns the device.
+#
+# Writing the PCI address to the driver's "unbind" file tells the kernel:
+#
+#   "Detach this PCI device from this driver."
+#
+# This does NOT remove the device from the PCI bus. It just disconnects
+# the device from the current kernel driver.
+if [[ -n "$CURRENT_DRIVER" ]]; then
+    echo "Unbinding $DEV from $CURRENT_DRIVER..."
+
+    echo "$DEV" > "/sys/bus/pci/drivers/$CURRENT_DRIVER/unbind"
+fi
+
+
+# ---------------------------------------------------------------------------
+# STEP 7: Bind the device to vfio-pci
+# ---------------------------------------------------------------------------
+#
+# Now that no other driver owns the PCI function, explicitly attach
+# to vfio-pci.
+#
+# Writing the PCI address into the vfio-pci driver's bind file tells
+# the kernel to hand the device to vfio-pci.
+echo "Binding $DEV to vfio-pci..."
+
+echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
+
+
+# ---------------------------------------------------------------------------
+# STEP 8: Verify that the operation succeeded
+# ---------------------------------------------------------------------------
+#
+# Resolve the device's current driver again and confirm that it =
+# vfio-pci.
+#
+# If something unexpected happened, the script exits with an error so
+# systemd will record the service as failed rather than silently pretending
+# everything worked.
+# Helps a lot for troubleshooting after boot
+if [[ ! -L "$DEVICE/driver" ]]; then
+    echo "ERROR: $DEV has no driver after attempting VFIO binding."
+    exit 1
+fi
+
+FINAL_DRIVER="$(basename "$(readlink -f "$DEVICE/driver")")"
+
+
+# Confirm that vfio-pci owns the device.
+if [[ "$FINAL_DRIVER" != "vfio-pci" ]]; then
+    echo "ERROR: $DEV ended up bound to $FINAL_DRIVER instead of vfio-pci."
+    exit 1
+fi
+
+
+# ---------------------------------------------------------------------------
+# STEP 9: Success
+# ---------------------------------------------------------------------------
+#
+# At this point the NVIDIA USB controller is reserved for VFIO.
+#
+# When Tiny11 starts, libvirt/QEMU can pass this PCI function through
+# together with the other NVIDIA functions.
+echo "SUCCESS: $DEV is bound to vfio-pci."
+
+exit 0
