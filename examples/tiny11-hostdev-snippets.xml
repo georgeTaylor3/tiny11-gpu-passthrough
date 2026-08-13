@@ -1,0 +1,57 @@
+<!--
+  Sanitized libvirt PCI passthrough examples for Tiny11.
+
+  Only the relevant NVIDIA PCI hostdev entries are shown here.
+  Host-specific UUIDs, MAC addresses, disk paths, serial numbers,
+  and unrelated VM configuration are intentionally omitted.
+-->
+
+<!-- NVIDIA GPU: 0000:01:00.0 -->
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+    <address domain='0x0000'
+             bus='0x01'
+             slot='0x00'
+             function='0x0'/>
+  </source>
+</hostdev>
+
+<!-- NVIDIA HD Audio: 0000:01:00.1 -->
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+    <address domain='0x0000'
+             bus='0x01'
+             slot='0x00'
+             function='0x1'/>
+  </source>
+</hostdev>
+
+<!-- NVIDIA USB Controller: 0000:01:00.2 -->
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+    <address domain='0x0000'
+             bus='0x01'
+             slot='0x00'
+             function='0x2'/>
+  </source>
+</hostdev>
+
+<!-- NVIDIA USB-C / UCSI Controller: 0000:01:00.3 -->
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+    <address domain='0x0000'
+             bus='0x01'
+             slot='0x00'
+             function='0x3'/>
+  </source>
+</hostdev>
+
+<!--
+  SPICE USB redirection remains available separately.
+
+  Example:
+
+  <redirdev bus='usb' type='spicevmc'>
+    ...
+  </redirdev>
+-->
