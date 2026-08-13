@@ -1,0 +1,13 @@
+[Unit]
+Description=Bind NVIDIA USB controller to vfio-pci
+After=systemd-modules-load.service
+Before=libvirtd.service
+ConditionPathExists=/sys/bus/pci/devices/0000:01:00.2
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bind-nvidia-usb-vfio
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
