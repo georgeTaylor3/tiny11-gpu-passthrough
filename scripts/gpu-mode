@@ -1,0 +1,678 @@
+#!/bin/bash
+
+# ============================================================================
+# gpu-mode
+#
+# Purpose:
+#   Prepare the NEXT Linux boot for one of two GPU modes:
+#
+#     mint
+#       Linux Mint is allowed to use the NVIDIA GTX 1660 Ti normally.
+#       The NVIDIA Linux driver is allowed to bind to the GPU.
+#
+#     tiny11
+#       The GTX 1660 Ti and its related PCI functions are reserved for
+#       vfio-pci so they can be passed through to the Tiny11 VM.
+#
+# IMPORTANT:
+#   This script intentionally does NOT perform a live GPU detach/rebind.
+#
+#   It changes boot configuration and then requires a reboot.
+#
+#   This is intentional because this laptop's GTX 1660 Ti has already
+#   demonstrated D3cold/reset behavior. A reboot gives the GPU a clean
+#   initialization under the correct driver.
+# ============================================================================
+#
+#future notes: add in nvidia driver command precheck before starting anything
+
+# Exit if:
+#   - a command fails
+#   - an undefined variable is used
+#   - any command in a pipeline fails
+set -euo pipefail
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Main GRUB configuration file.
+GRUB_FILE="/etc/default/grub"
+
+# File that blacklists the NVIDIA Linux drivers while passthrough is enabled.
+BLACKLIST_FILE="/etc/modprobe.d/blacklist-nvidia-passthrough.conf"
+
+# Udev rules that force the NVIDIA PCI functions toward vfio-pci.
+UDEV_RULE="/etc/udev/rules.d/99-vfio-pci.rules"
+
+# Systemd service: ensures the NVIDIA USB controller
+# at 01:00.2 binds to vfio-pci instead of xhci_hcd.
+VFIO_USB_SERVICE="nvidia-usb-vfio.service"
+
+# Small state file: see whats configured for the next boot.
+MODE_FILE="/etc/gpu-mode"
+
+
+# NVIDIA PCI IDs used by hardware:
+#
+#   10de:2191 = GTX 1660 Ti GPU
+#   10de:1aeb = NVIDIA HD Audio
+#   10de:1aec = NVIDIA USB 3.1 controller
+#   10de:1aed = NVIDIA USB-C/UCSI controller
+#
+# In Tiny11 mode, PCI IDs are assigned to vfio-pci at boot.
+VFIO_PARAMETER="vfio-pci.ids=10de:2191,10de:1aeb,10de:1aec,10de:1aed"
+
+
+# When Mint mode is enabled...rename the passthrough files so
+# modprobe and udev stop processing them.
+BLACKLIST_DISABLED="${BLACKLIST_FILE}.disabled"
+UDEV_DISABLED="${UDEV_RULE}.disabled"
+
+
+# ============================================================================
+# ROOT CHECK
+# ============================================================================
+
+# make sure ur root
+#
+# Example:
+#
+#   sudo gpu-mode mint
+#
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: This command must be run as root."
+    echo
+    echo "Use:"
+    echo "  sudo gpu-mode mint"
+    echo "or:"
+    echo "  sudo gpu-mode tiny11"
+    echo "or:"
+    echo "  sudo gpu-mode status"
+    exit 1
+fi
+
+
+# ============================================================================
+# FUNCTION: show_status
+# ============================================================================
+
+# Display:
+#   - which mode is configured for the next boot
+#   - which driver currently owns each NVIDIA PCI function
+#   - GPU power state
+#   - PRIME mode
+#   - Tiny11 VM state
+#
+# Note:
+#   "Configured next-boot mode" and the CURRENT driver state can differ
+#   before a reboot. deal with it it's fine.
+show_status() {
+
+    echo "============================================================"
+    echo "GPU MODE STATUS"
+    echo "============================================================"
+
+
+    # -----------------------------------------------------------------------
+    # Show which mode has been configured for the NEXT boot.
+    #
+    # This comes from /etc/gpu-mode and represents what the toggle script
+    # most recently prepared.
+    #
+    # Example:
+    #
+    #   Configured next-boot mode: tiny11
+    #
+    # The running system may still be in Mint mode until a reboot.
+    # -----------------------------------------------------------------------
+
+    if [[ -f "$MODE_FILE" ]]; then
+        NEXT_MODE="$(cat "$MODE_FILE")"
+    else
+        NEXT_MODE="unknown"
+    fi
+
+    echo "Configured next-boot mode: $NEXT_MODE"
+
+    # -----------------------------------------------------------------------
+    # Determine the CURRENT active GPU mode.
+    #
+    # Derived from the driver currently attached to the primary
+    # NVIDIA GPU at PCI addie 01:00.0.
+    #
+    # If vfio-pci owns the GPU:
+    #     Current active mode = tiny11
+    #
+    # If the nvidia Lin driver owns the GPU:
+    #     Current active mode = mint
+    #
+    # Anything else is reported as unknown so we dont assert something wrong
+    # -----------------------------------------------------------------------
+
+    GPU_DRIVER_PATH="/sys/bus/pci/devices/0000:01:00.0/driver"
+
+    if [[ -L "$GPU_DRIVER_PATH" ]]; then
+
+        GPU_DRIVER="$(basename "$(readlink -f "$GPU_DRIVER_PATH")")"
+
+        case "$GPU_DRIVER" in
+
+            vfio-pci)
+                ACTIVE_MODE="tiny11"
+                ;;
+
+            nvidia)
+                ACTIVE_MODE="mint"
+                ;;
+
+            *)
+                ACTIVE_MODE="unknown ($GPU_DRIVER)"
+                ;;
+
+        esac
+
+    else
+
+        GPU_DRIVER="none"
+        ACTIVE_MODE="unknown (GPU has no driver)"
+
+    fi
+
+
+    echo "Current active mode:        $ACTIVE_MODE"
+
+
+    # -----------------------------------------------------------------------
+    # Warn if the next-boot mode and current mode differ.
+    #
+    # Usually means there hasnt been reboot since last gpu-mode change
+    # -----------------------------------------------------------------------
+
+    if [[ "$NEXT_MODE" != "unknown" ]] &&
+       [[ "$ACTIVE_MODE" != "$NEXT_MODE" ]]; then
+
+        echo
+        echo "NOTICE: A mode change is pending."
+        echo "        Reboot to activate: $NEXT_MODE"
+
+    fi
+
+
+    echo
+    echo "Current running-kernel state:"
+    echo
+
+
+    # -----------------------------------------------------------------------
+    # Show the driver attached to each NVIDIA PCI function.
+    #
+    # NVIDIA device layout:
+    #
+    #   01:00.0 = GTX 1660 Ti GPU
+    #   01:00.1 = NVIDIA HD Audio
+    #   01:00.2 = NVIDIA USB 3.1 controller
+    #   01:00.3 = NVIDIA USB-C/UCSI controller
+    # -----------------------------------------------------------------------
+
+    for dev in 01:00.0 01:00.1 01:00.2 01:00.3; do
+
+        echo -n "$dev -> "
+
+        driver_path="/sys/bus/pci/devices/0000:$dev/driver"
+
+        if [[ -L "$driver_path" ]]; then
+            basename "$(readlink -f "$driver_path")"
+        else
+            echo "no driver"
+        fi
+
+    done
+
+
+    echo
+
+
+    # -----------------------------------------------------------------------
+    # Show current physical PCI power state of the GTX 1660 Ti.
+    #
+    # In Tiny11 mode normally :
+    #
+    #   D0
+    #
+    # as there were issues were it enter d3cold
+    # -----------------------------------------------------------------------
+
+    if [[ -e /sys/bus/pci/devices/0000:01:00.0/power_state ]]; then
+
+        echo -n "GPU power state: "
+        cat /sys/bus/pci/devices/0000:01:00.0/power_state
+
+    fi
+
+
+    echo
+
+
+    # -----------------------------------------------------------------------
+    # Show NVIDIA PRIME configuration.
+    #
+    # In Mint mode this should say:
+    #
+    #   on-demand
+    #
+    # prime-select REMEBERS ITS ETTING  even while the physical
+    # NVIDIA GPU is assigned to vfio-pci, so this value by itself does NOT
+    # determine the current GPU mode.
+    # -----------------------------------------------------------------------
+
+    if command -v prime-select >/dev/null 2>&1; then
+
+        echo -n "PRIME mode: "
+        prime-select query 2>/dev/null || true
+
+    fi
+
+
+    echo
+
+
+    # -----------------------------------------------------------------------
+    # Show the current Tiny11 VM state.
+    # -----------------------------------------------------------------------
+
+    if virsh dominfo tiny11 >/dev/null 2>&1; then
+
+        echo -n "Tiny11 VM state: "
+        virsh domstate tiny11
+
+    fi
+
+
+    echo
+}
+
+# ============================================================================
+# FUNCTION: rebuild_boot_files
+# ============================================================================
+
+# Any change involving:
+#
+#   - module blacklists
+#   - VFIO boot behavior
+#   - NVIDIA boot behavior
+#
+# should change initramfs.
+#
+# member... redo GRUB.
+rebuild_boot_files() {
+
+    echo
+    echo "Updating initramfs..."
+    update-initramfs -u -k all
+
+    echo
+    echo "Updating GRUB..."
+    update-grub
+
+    echo
+}
+
+
+# ============================================================================
+# FUNCTION: enable_tiny11_mode
+# ============================================================================
+
+# Prepare the NEXT boot for dedicated GPU passthrough.
+#
+# In this mode:
+#
+#   01:00.0 -> vfio-pci
+#   01:00.1 -> vfio-pci
+#   01:00.2 -> vfio-pci
+#   01:00.3 -> vfio-pci
+#
+# Linux Mint only gets the Intel GPU.
+# Tiny11onyl gets GTX 1660 Ti.
+enable_tiny11_mode() {
+
+    echo "============================================================"
+    echo "CONFIGURING TINY11 GPU PASSTHROUGH MODE"
+    echo "============================================================"
+    echo
+
+
+    # ------------------------------------------------------------------------
+    # CHECK IF TINY11 VM IS RUNNING
+    # ------------------------------------------------------------------------
+    #
+    # I'm not sure what happens if gpu ownership is switch when tiny11 is on
+    # I need this laptop and setup rn for work so ill test it later
+    if virsh dominfo tiny11 >/dev/null 2>&1; then
+
+        VM_STATE="$(virsh domstate tiny11 | tr -d '\r')"
+
+        if [[ "$VM_STATE" != "shut off" ]]; then
+            echo "ERROR: Tiny11 is currently: $VM_STATE"
+            echo
+            echo "Shut down Tiny11 before changing GPU boot mode."
+            exit 1
+        fi
+
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Add VFIO PCI IDs to the GRUB kernel command line
+    # ------------------------------------------------------------------------
+    #
+    # add the parameter if it is not already present.
+    #
+    # tells vfio-pci to claim the NVIDIA PCI functions during boot.
+    if ! grep -qF "$VFIO_PARAMETER" "$GRUB_FILE"; then
+
+        echo "Adding NVIDIA PCI IDs to VFIO kernel parameters..."
+
+        sed -i \
+            "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"/GRUB_CMDLINE_LINUX_DEFAULT=\"$VFIO_PARAMETER /" \
+            "$GRUB_FILE"
+
+    else
+        echo "VFIO PCI IDs are already present in GRUB."
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Enable the NVIDIA driver blacklist
+    # ------------------------------------------------------------------------
+    #
+    # Tiny11 mode prevents the normal NVIDIA Linux driver from taking
+    # ownership of the GPU before vfio-pci can use it.
+    if [[ -f "$BLACKLIST_DISABLED" ]]; then
+
+        echo "Enabling NVIDIA passthrough blacklist..."
+
+        mv "$BLACKLIST_DISABLED" "$BLACKLIST_FILE"
+
+    elif [[ -f "$BLACKLIST_FILE" ]]; then
+
+        echo "NVIDIA passthrough blacklist is already enabled."
+
+    else
+
+        echo "ERROR: NVIDIA blacklist configuration is missing."
+	echo "See blacklist file <github url> for template"
+        exit 1
+
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Enable VFIO udev rules
+    # ------------------------------------------------------------------------
+    #
+    # These rules set driver_override=vfio-pci for the NVIDIA PCI functions.
+    if [[ -f "$UDEV_DISABLED" ]]; then
+
+        echo "Enabling VFIO udev rules..."
+
+        mv "$UDEV_DISABLED" "$UDEV_RULE"
+
+    elif [[ -f "$UDEV_RULE" ]]; then
+
+        echo "VFIO udev rules are already enabled."
+
+    else
+
+        echo "ERROR: VFIO udev rules are missing."
+	echo ""
+	echo "see <github url> for udev template"
+        exit 1
+
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Enable the NVIDIA USB VFIO service
+    # ------------------------------------------------------------------------
+    #
+    # fixes the 01:00.2 device that previously bound to xhci_hcd.
+    echo "Enabling NVIDIA USB -> VFIO boot service..."
+
+    systemctl enable "$VFIO_USB_SERVICE"
+
+
+    # ------------------------------------------------------------------------
+    # Record the configured mode
+    # ------------------------------------------------------------------------
+    #
+    # This does not control anything.
+    # only lets
+    #
+    #   sudo gpu-mode status
+    #
+    # show which mode has been prepared for the next boot.
+    # probably a better way to do this
+    echo "tiny11" > "$MODE_FILE"
+
+
+    # ------------------------------------------------------------------------
+    # Rebuild initramfs and GRUB
+    # ------------------------------------------------------------------------
+    rebuild_boot_files
+
+
+    echo "============================================================"
+    echo "Tiny11 passthrough mode is configured."
+    echo
+    echo "REBOOT REQUIRED."
+    echo
+    echo "After reboot, verify with:"
+    echo
+    echo "  sudo gpu-mode status"
+    echo "============================================================"
+}
+
+
+# ============================================================================
+# FUNCTION: enable_mint_mode
+# ============================================================================
+
+# Prepare the NEXT boot for normal Linux Mint use.
+#
+# In this mode:
+#
+#   - VFIO no longer reserves the GTX 1660 Ti
+#   - NVIDIA Linux drivers are allowed to load
+#   - VFIO udev overrides are disabled
+#   - the 01:00.2 VFIO binding service is disabled
+#   - PRIME is configured for on-demand mode
+#
+# Intel continues driving the desktop while the GTX 1660 Ti becomes
+# available to Linux applications as needed.
+enable_mint_mode() {
+
+    echo "============================================================"
+    echo "CONFIGURING NORMAL LINUX MINT GPU MODE"
+    echo "============================================================"
+    echo
+
+
+    # ------------------------------------------------------------------------
+    # MAKE SURE TINY11 IS OFF/SHUT OFF
+    # ------------------------------------------------------------------------
+    # again...dont know what happens if you reassign the driver while tiny11 
+    # is on. testing later
+    if virsh dominfo tiny11 >/dev/null 2>&1; then
+
+        VM_STATE="$(virsh domstate tiny11 | tr -d '\r')"
+
+        if [[ "$VM_STATE" != "shut off" ]]; then
+            echo "ERROR: Tiny11 is currently: $VM_STATE"
+            echo
+            echo "Shut down Tiny11 before changing GPU boot mode with"
+	    echo
+	    echo "vrish destroy tin11"
+	    echo
+            exit 1
+        fi
+
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Remove the NVIDIA VFIO PCI IDs from GRUB
+    # ------------------------------------------------------------------------
+    #
+    # Once this parameter is removed, vfio-pci will no longer automatically
+    # reserve the GTX 1660 Ti at boot.
+    echo "Removing NVIDIA VFIO PCI IDs from GRUB..."
+
+    sed -i \
+        "s/${VFIO_PARAMETER} //g; s/ ${VFIO_PARAMETER}//g; s/${VFIO_PARAMETER}//g" \
+        "$GRUB_FILE"
+
+
+    # ------------------------------------------------------------------------
+    # Disable the NVIDIA blacklist
+    # ------------------------------------------------------------------------
+    #
+    # modprove generally/probably/mostly processes things in /etc/modprobe.d 
+    # that end in .conf.
+    #
+    # Renaming the file to .conf.disabled prevents it from being used during
+    # the next boot. normal NVIDIA Linux modules to load.
+    # there is probably a more safe way but this also has everything
+    # in the same place for readability
+    if [[ -f "$BLACKLIST_FILE" ]]; then
+
+        echo "Disabling NVIDIA passthrough blacklist..."
+
+        mv "$BLACKLIST_FILE" "$BLACKLIST_DISABLED"
+
+    else
+
+        echo "NVIDIA passthrough blacklist is already disabled."
+
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Disable VFIO udev rules
+    # ------------------------------------------------------------------------
+    #
+    # same thing as above. changing *.rules to *.rules.somethingElse
+    # Udev processes files ending in .rules.
+    #
+    # different suffix than .rules prevents driver_override=vfio-pci from being applied
+    # to the NVIDIA devices on the next boot.
+    if [[ -f "$UDEV_RULE" ]]; then
+
+        echo "Disabling VFIO udev rules..."
+
+        mv "$UDEV_RULE" "$UDEV_DISABLED"
+
+    else
+
+        echo "VFIO udev rules are already disabled."
+
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Disable the custom NVIDIA USB VFIO service
+    # ------------------------------------------------------------------------
+    #
+    # Mint mode = DO NOT ALLOW 01:00.2 to be taken by hardware.
+    echo "Disabling NVIDIA USB -> VFIO boot service..."
+
+    systemctl disable "$VFIO_USB_SERVICE"
+
+
+    # ------------------------------------------------------------------------
+    # Configure PRIME on-demand mode
+    # ------------------------------------------------------------------------
+    #
+    # In on-demand mode:
+    #
+    #   Intel GPU:
+    #       drives Linux desktop
+    #
+    #   GTX 1660 Ti:
+    #       remains available for applications that explicitly request it
+    #
+    # This is the works to allow on demand. probably wont be the same. have had issues
+    # with nvidia updating driver info in the past. deserves a recheck after driver update
+    if command -v prime-select >/dev/null 2>&1; then
+
+        echo "Configuring NVIDIA PRIME on-demand mode..."
+
+        prime-select on-demand
+
+    fi
+
+
+    # ------------------------------------------------------------------------
+    # Record the configured mode
+    # ------------------------------------------------------------------------
+    echo "mint" > "$MODE_FILE"
+
+
+    # ------------------------------------------------------------------------
+    # Rebuild initramfs and GRUB
+    # ------------------------------------------------------------------------
+    rebuild_boot_files
+
+
+    echo "============================================================"
+    echo "Normal Linux Mint GPU mode is configured."
+    echo
+    echo "REBOOT REQUIRED."
+    echo
+    echo "After reboot, verify with:"
+    echo
+    echo "  sudo gpu-mode status"
+    echo "============================================================"
+}
+
+
+# ============================================================================
+# COMMAND PARSER
+# ============================================================================
+
+# Decide what the user requested:
+#
+#   gpu-mode mint
+#   gpu-mode tiny11
+#   gpu-mode status
+case "${1:-}" in
+
+    mint)
+        enable_mint_mode
+        ;;
+
+    tiny11)
+        enable_tiny11_mode
+        ;;
+
+    status)
+        show_status
+        ;;
+
+    *)
+        echo "Usage:"
+        echo
+        echo "  sudo gpu-mode mint"
+        echo "      Configure the next boot for normal Linux Mint NVIDIA use."
+        echo
+        echo "  sudo gpu-mode tiny11"
+        echo "      Configure the next boot for dedicated Tiny11 GPU passthrough."
+        echo
+        echo "  sudo gpu-mode status"
+        echo "      Show configured mode and current driver ownership."
+        echo
+        exit 1
+        ;;
+
+esac
