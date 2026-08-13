@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+
+# ---------------------------------------------------------------------------
+# Tiny11 GPU passthrough safety hook
+# ---------------------------------------------------------------------------
+#
+# Purpose:
+#   Prevent the Tiny11 VM from starting unless all NVIDIA PCI functions
+#   required for GPU passthrough are currently bound to vfio-pci.
+#
+# Why:
+#   If Tiny11 is started while Linux Mint still owns the NVIDIA GPU,
+#   libvirt/QEMU may try to attach hardware that is already in use by
+#   Linux drivers such as:
+#
+#       nvidia
+#       snd_hda_intel
+#       xhci_hcd
+#       nvidia-gpu
+#
+#   This script checks the actual driver ownership of the hardware before
+#   Tiny11 starts.
+#
+#   If any required device is NOT bound to vfio-pci, the script exits with
+#   an error. libvirt then refuses to start the VM.
+#
+# ---------------------------------------------------------------------------
+
+
+# Exit when an unset variable is referenced.
+#
+#use -u to record errors wather than -e
+set -u
+
+
+# ---------------------------------------------------------------------------
+# Arguments supplied by libvirt
+# ---------------------------------------------------------------------------
+#
+# For QEMU hooks, libvirt supplies a bunch of positional args.
+#
+# For the startup check we care about:
+#
+#   $1 = VM/domain name
+#   $2 = operation
+#   $3 = sub-operation
+#
+# Example:
+#
+#   tiny11 prepare begin
+#
+# "prepare begin" happens before QEMU actually starts the VM.
+# catch the tartup before its startsup.
+# ---------------------------------------------------------------------------
+
+VM_NAME="$1"
+OPERATION="$2"
+SUBOPERATION="$3"
+
+
+# ---------------------------------------------------------------------------
+# Only apply this safeguard to Tiny11
+# ---------------------------------------------------------------------------
+#
+# libvirt can call this hook for other virtual machines too.
+#
+# If another VM is being started or stopped, immediately exit successfully
+# and do nothing.
+# Add in more granular uuid checking of some sort later
+# ---------------------------------------------------------------------------
+
+if [[ "$VM_NAME" != "tiny11" ]]; then
+    exit 0
+fi
+
+
+# ---------------------------------------------------------------------------
+# Only perform the check before Tiny11 starts
+# ---------------------------------------------------------------------------
+#
+# We only want to enforce this during:
+#
+#   prepare begin
+#
+# Other hook events can include start, stopped, release, etc.
+#
+# Those events should not trigger this validation.
+# ---------------------------------------------------------------------------
+
+if [[ "$OPERATION" != "prepare" || "$SUBOPERATION" != "begin" ]]; then
+    exit 0
+fi
+
+
+# ---------------------------------------------------------------------------
+# NVIDIA PCI devices required by Tiny11
+# ---------------------------------------------------------------------------
+#
+# GTX 1660 Ti in this hardware exposes 4 PCI functions:
+#
+#   01:00.0 = NVIDIA GPU
+#   01:00.1 = NVIDIA HDMI/DisplayPort audio
+#   01:00.2 = NVIDIA USB controller
+#   01:00.3 = NVIDIA USB-C/UCSI controller
+#
+# vfio-pci must own all 4 before we startup tiny11
+#
+# The full PCI addresses has the PCI domain:
+#
+#   0000:01:00.x
+# ---------------------------------------------------------------------------
+
+DEVICES=(
+    "0000:01:00.0"
+    "0000:01:00.1"
+    "0000:01:00.2"
+    "0000:01:00.3"
+)
+
+
+# ---------------------------------------------------------------------------
+# Track whether any validation check fails
+# ---------------------------------------------------------------------------
+#
+# 0 = everything is okay
+# 1 = one or more devices failed validation
+#
+# check every device so the error output shows the full state instead
+# of stopping at the first bad device.
+# ---------------------------------------------------------------------------
+
+FAILED=0
+
+for DEV in "${DEVICES[@]}"; do
+
+    # The sysfs path that points to the kernel driver currently controlling
+    # the DEV (aka PCI device).
+    #
+    # Ex:
+    #
+    # /sys/bus/pci/devices/0000:01:00.0/driver
+    #
+    # This is normally a symbolic link to something such as:
+    #
+    #   /sys/bus/pci/drivers/vfio-pci  OR   /sys/bus/pci/drivers/nvidia
+    #
+    DRIVER_LINK="/sys/bus/pci/devices/$DEV/driver"
+
+
+    # -----------------------------------------------------------------------
+    # Make sure the PCI device exists
+    # -----------------------------------------------------------------------
+    #
+    # If the sysfs device directory is missing, something is BIG
+    # wrong: changed PCI addressing, disabled hardware, firmware issue, etc.
+    # -----------------------------------------------------------------------
+
+    if [[ ! -e "/sys/bus/pci/devices/$DEV" ]]; then
+        echo "ERROR: Required passthrough device $DEV does not exist." >&2
+        FAILED=1
+        continue
+    fi
+
+
+    # -----------------------------------------------------------------------
+    # Make sure the device currently has a kernel driver
+    # -----------------------------------------------------------------------
+    #
+    # The "driver" entry in sysfs is a symbolic link.
+    #
+    # If it does not exist, the device is currently unbound.
+    # That is not the state needed for known-good configuration.
+    # -----------------------------------------------------------------------
+
+    if [[ ! -L "$DRIVER_LINK" ]]; then
+        echo "ERROR: $DEV has no bound driver." >&2
+        FAILED=1
+        continue
+    fi
+
+
+    # -----------------------------------------------------------------------
+    # Determine the actual driver name
+    # -----------------------------------------------------------------------
+    #
+    # readlink -f resolves the driver symlink to something like:
+    #
+    #   /sys/bus/pci/drivers/vfio-pci
+    #
+    # where basename reduces that to:
+    #
+    #   vfio-pci
+    # -----------------------------------------------------------------------
+
+    DRIVER="$(basename "$(readlink -f "$DRIVER_LINK")")"
+
+
+    # -----------------------------------------------------------------------
+    # The device MUST currently belong to vfio-pci
+    # -----------------------------------------------------------------------
+    #
+    # Examples of BAD states:
+    #
+    #   01:00.0 -> nvidia
+    #   01:00.1 -> snd_hda_intel
+    #   01:00.2 -> xhci_hcd
+    #   01:00.3 -> nvidia-gpu
+    #
+    # The only accepted state for Tiny11 startup for this project is:
+    #
+    #   vfio-pci
+    #
+    # -----------------------------------------------------------------------
+
+    if [[ "$DRIVER" != "vfio-pci" ]]; then
+        echo "ERROR: $DEV is bound to '$DRIVER', not 'vfio-pci'." >&2
+        FAILED=1
+    fi
+
+done
+
+
+# ---------------------------------------------------------------------------
+# Block Tiny11 startup if any device failed validation
+# ---------------------------------------------------------------------------
+#
+# A non-zero exit status from the prepare hook tells libvirt:
+#
+#   "Do not start this VM."
+#
+# provide a message showing the correct recovery procedure
+# aka
+#   sudo gpu-mode tiny11
+#   sudo reboot
+#   sudo gpu-mode status
+# ---------------------------------------------------------------------------
+
+if [[ "$FAILED" -ne 0 ]]; then
+    echo >&2
+    echo "Tiny11 startup BLOCKED." >&2
+    echo "The NVIDIA GPU is not prepared for passthrough." >&2
+    echo >&2
+    echo "Prepare the system for Tiny11 GPU passthrough with:" >&2
+    echo >&2
+    echo "    sudo gpu-mode tiny11" >&2
+    echo "    sudo reboot" >&2
+    echo >&2
+    echo "After reboot, verify the state with:" >&2
+    echo >&2
+    echo "    sudo gpu-mode status" >&2
+    echo >&2
+    echo "Then start Tiny11 again with :" >&2
+    echo >&2
+    echo "    virsh start tiny11" >&2
+
+    exit 1
+fi
+
+
+# ---------------------------------------------------------------------------
+# Success
+# ---------------------------------------------------------------------------
+#
+# If we reach this point, all four NVIDIA PCI functions are currently bound
+# to vfio-pci.
+#
+# Return success to libvirt so Tiny11 is allowed to start.
+# ---------------------------------------------------------------------------
+
+exit 0
