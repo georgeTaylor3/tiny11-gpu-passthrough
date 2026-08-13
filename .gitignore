@@ -45,3 +45,6 @@ tokens*
 # Windows / miscellaneous
 Thumbs.db
 Desktop.ini
+
+# Personal Security Phrases
+security-scan-patterns.local

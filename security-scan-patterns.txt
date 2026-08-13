@@ -1,0 +1,17 @@
+# Personal identifiers
+
+# GitHub credentials
+github_pat_
+ghp_
+gho_
+
+# Cryptographic material
+BEGIN .*PRIVATE KEY
+
+# Generic secret terminology
+password
+passwd
+secret
+token
+api[_-]?key
+private[_-]?key

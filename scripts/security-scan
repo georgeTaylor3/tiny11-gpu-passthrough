@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+# Scan the repository for sensitive strings and patterns listed in:
+#   security-scan-patterns.txt
+#
+# Excludes:
+#   .git directory
+#
+# Exit codes:
+#   0 = no matches found
+#   1 = potential sensitive content found
+
+set -u
+
+PATTERN_FILE="security-scan-patterns.txt"
+FOUND=0
+
+if [[ ! -f "$PATTERN_FILE" ]]; then
+    echo "ERROR: $PATTERN_FILE not found."
+    exit 1
+fi
+
+echo "Scanning repository for sensitive content..."
+echo
+
+while IFS= read -r PATTERN; do
+
+    # Ignore blank lines and comments.
+    [[ -z "$PATTERN" ]] && continue
+    [[ "$PATTERN" =~ ^[[:space:]]*# ]] && continue
+
+    echo "Checking pattern: $PATTERN"
+
+    if grep -RniE \
+        --exclude-dir=.git \
+        --exclude="$PATTERN_FILE" \
+        --exclude="security-scan" \
+        "$PATTERN" .; then
+
+        FOUND=1
+        echo
+    fi
+
+done < "$PATTERN_FILE"
+
+echo
+
+if [[ "$FOUND" -ne 0 ]]; then
+    echo "WARNING: Potential sensitive content was found."
+    echo "Review every match before committing or pushing."
+    exit 1
+fi
+
+echo "PASS: No configured sensitive patterns were found."
+exit 0
