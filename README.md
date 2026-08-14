@@ -56,3 +56,17 @@ See [SECURITY.md](SECURITY.md).
 This configuration is hardware-specific. PCI addresses, device IDs, IOMMU
 groups, driver behavior, firmware behavior, and power-management characteristics
 can differ significantly between systems.
+
+## Repository Structure
+
+- `docs/` — Step-by-step documentation covering hardware, IOMMU, KVM/libvirt, GPU passthrough, D3cold troubleshooting, GPU mode switching, startup safeguards, USB redirection, troubleshooting, and daily usage.
+- `scripts/` — Helper scripts for GPU mode switching, NVIDIA USB VFIO binding, and repository security scanning.
+- `systemd/` — systemd unit used to ensure the NVIDIA USB controller is bound to `vfio-pci`.
+- `udev/` — udev rules that assign the NVIDIA PCI functions to `vfio-pci` when passthrough mode is enabled.
+- `modprobe/` — VFIO kernel module configuration, including the NVIDIA D3cold workaround.
+- `libvirt/` — libvirt hook that prevents the Tiny11 VM from starting unless all required NVIDIA PCI functions are owned by `vfio-pci`.
+- `examples/` — Sanitized libvirt XML examples showing the PCI passthrough configuration without exposing host-specific VM information.
+- `security-scan-patterns.txt` — Public patterns used by the repository security scanner for human-reviewable findings.
+- `security-scan-critical-patterns.txt` — Higher-risk patterns displayed as critical findings by the repository security scanner.
+- `SECURITY.md` — Documents the repository's security scope and the types of sensitive information that must never be committed.
+- `.gitignore` — Prevents VM disks, installation media, keys, credentials, logs, temporary files, and local security-scanner data from being committed.
