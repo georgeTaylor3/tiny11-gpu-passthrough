@@ -70,3 +70,135 @@ can differ significantly between systems.
 - `security-scan-critical-patterns.txt` — Higher-risk patterns displayed as critical findings by the repository security scanner.
 - `SECURITY.md` — Documents the repository's security scope and the types of sensitive information that must never be committed.
 - `.gitignore` — Prevents VM disks, installation media, keys, credentials, logs, temporary files, and local security-scanner data from being committed.
+
+## File Installation Map
+
+The files in this repository are reference copies of the configuration used
+for this project.
+
+Files that configure the Linux host must be copied to their corresponding
+system locations before they can take effect.
+
+| Repository File | Destination on Linux Mint |
+|---|---|
+| `scripts/gpu-mode` | `/usr/local/sbin/gpu-mode` |
+| `scripts/bind-nvidia-usb-vfio` | `/usr/local/sbin/bind-nvidia-usb-vfio` |
+| `systemd/nvidia-usb-vfio.service` | `/etc/systemd/system/nvidia-usb-vfio.service` |
+| `udev/99-vfio-pci.rules` | `/etc/udev/rules.d/99-vfio-pci.rules` |
+| `modprobe/vfio-pci.conf` | `/etc/modprobe.d/vfio-pci.conf` |
+| `libvirt/hooks/qemu.d/10-tiny11-gpu-safety` | `/etc/libvirt/hooks/qemu.d/10-tiny11-gpu-safety` |
+
+### Repository-Only Files
+
+The following files are not installed into system directories and should
+remain in the cloned repository:
+
+- `README.md`
+- `SECURITY.md`
+- `.gitignore`
+- `docs/`
+- `security-scan-patterns.txt`
+- `security-scan-critical-patterns.txt`
+- `scripts/security-scan`
+
+The optional local file:
+
+```text
+security-scan-patterns.local
+```
+
+is intended for machine-specific or user-specific scan patterns and must
+remain excluded from Git.
+
+### Libvirt XML Example
+
+The file:
+
+```text
+examples/tiny11-hostdev-snippets.xml
+```
+
+is a sanitized reference example.
+
+It should not be copied directly into `/etc`.
+
+The relevant `<hostdev>` entries should instead be adapted to the user's
+virtual machine configuration using `virsh edit` or virt-manager.
+
+### Install the Host Configuration Files
+
+From the root of the cloned repository:
+
+```bash
+sudo install -m 755 \
+    scripts/gpu-mode \
+    /usr/local/sbin/gpu-mode
+
+sudo install -m 755 \
+    scripts/bind-nvidia-usb-vfio \
+    /usr/local/sbin/bind-nvidia-usb-vfio
+
+sudo install -m 644 \
+    systemd/nvidia-usb-vfio.service \
+    /etc/systemd/system/nvidia-usb-vfio.service
+
+sudo install -m 644 \
+    udev/99-vfio-pci.rules \
+    /etc/udev/rules.d/99-vfio-pci.rules
+
+sudo install -m 644 \
+    modprobe/vfio-pci.conf \
+    /etc/modprobe.d/vfio-pci.conf
+
+sudo install -D -m 755 \
+    libvirt/hooks/qemu.d/10-tiny11-gpu-safety \
+    /etc/libvirt/hooks/qemu.d/10-tiny11-gpu-safety
+```
+
+### Additional Host Configuration
+
+Copying the repository files is only part of the setup.
+
+This project also requires host-specific configuration that cannot safely
+be installed as a generic copy operation, including:
+
+- enabling IOMMU
+- configuring the kernel command line in `/etc/default/grub`
+- loading the required VFIO modules through `/etc/initramfs-tools/modules`
+- rebuilding the initramfs
+- regenerating the GRUB configuration
+- enabling the NVIDIA USB VFIO systemd service
+- adapting PCI device IDs to the user's hardware
+- configuring the virtual machine's PCI host devices
+- installing the NVIDIA driver inside Windows
+- verifying device ownership before starting the VM
+
+These steps are documented in the files under `docs/`.
+
+### Important
+
+The PCI device IDs and addresses used in this repository are specific to the
+hardware used for this project.
+
+Do not blindly copy PCI IDs such as:
+
+```text
+10de:2191
+10de:1aeb
+10de:1aec
+10de:1aed
+```
+
+or PCI addresses such as:
+
+```text
+01:00.0
+01:00.1
+01:00.2
+01:00.3
+```
+
+onto another system.
+
+Users should identify their own GPU and associated PCI functions before
+modifying VFIO, udev, GRUB, systemd, or libvirt configuration.
